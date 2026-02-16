@@ -10,17 +10,18 @@ from io import BytesIO
 import threading
 import time
 from dotenv import load_dotenv
+import ctypes
 
-# --- FIX NA ŚCIEŻKI ---
+# ustawienie katalogu roboczego na ten, w którym znajduje się skrypt, aby poprawnie ładować .env
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv()
 
-# --- KONFIGURACJA API ---
+# pobranie danych autoryzacyjnych z .env
 CLIENT_ID = os.getenv('SPOTIPY_CLIENT_ID')
 CLIENT_SECRET = os.getenv('SPOTIPY_CLIENT_SECRET')
 REDIRECT_URI = os.getenv('SPOTIPY_REDIRECT_URI')
 
-# Tlumienie bledow
+# przekierowanie stderr do pliku, aby debugować ewentualne błędy
 sys.stderr = open('debug_overlay.log', 'w') 
 
 scope = "user-read-playback-state,user-modify-playback-state"
@@ -33,19 +34,35 @@ try:
 except Exception as e:
     with open("debug_overlay.log", "a") as f: f.write(str(e))
 
-# --- GUI (Wyglad) ---
+# główna klasa odpowiedzialna za nakładkę
 class VolumeOverlay:
     def __init__(self):
         self.root = tk.Tk()
         self.root.overrideredirect(True) 
         self.root.attributes("-topmost", True) 
-        self.root.attributes("-alpha", 0.95) 
+        
+        # ustawienie przezroczystości (0.0 - całkowicie przezroczyste, 1.0 - nieprzezroczyste)
+        self.root.attributes("-alpha", 0.9) 
+        
         self.root.configure(bg="#1f1f1f") 
         self.root.geometry(f"350x120+50+50") 
 
+        # ustawienia okna na "przenikające" (kliknięcia przechodzą przez nie)
+        self.root.update_idletasks() # potrzebne do poprawnego pobrania ID okna
+        hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+        
+        # definicje stałych dla stylów okna
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x00080000
+        WS_EX_TRANSPARENT = 0x00000020
+        
+        # pobranie aktualnego stylu i dodanie flag dla nakładki
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
+
         self.hide_timer = None
 
-        # Elementy
+        # elementy GUI
         self.cover_label = tk.Label(self.root, bg="#1f1f1f")
         self.cover_label.place(x=10, y=10, width=100, height=100)
 
@@ -65,23 +82,23 @@ class VolumeOverlay:
         self.current_cover_url = ""
 
     def update_info(self, title, artist, volume, cover_url):
-        # Aktualizacja tekstow
+        # aktualizacja tekstow
         self.title_label.config(text=title)
         self.artist_label.config(text=artist)
         
-        # Pasek glosnosci
+        # aktualizacja paska glosnosci
         if volume is not None:
             bar_width = int(volume * 2) 
             self.vol_canvas.coords(self.vol_bar, 0, 0, bar_width, 6)
 
-        # Pobieranie okladki
+        # pobierz i ustaw okładkę tylko jeśli się zmieniła
         if cover_url and cover_url != self.current_cover_url:
             self.current_cover_url = cover_url
             threading.Thread(target=self.download_image, args=(cover_url,), daemon=True).start()
 
         self.root.deiconify()
         
-        # Restart timera (3 sekundy)
+        # automatyczne ukrywanie po 3 sekundach
         if self.hide_timer:
             self.root.after_cancel(self.hide_timer)
         self.hide_timer = self.root.after(3000, self.root.withdraw)
@@ -106,42 +123,23 @@ class VolumeOverlay:
 
 overlay = VolumeOverlay()
 
-# --- MONITOR ZMIAN (Auto-wykrywanie piosenki) ---
-def monitor_loop():
-    last_track_id = None
-    
-    while True:
-        try:
-            current = sp.current_playback()
+# funkcja odswiezajaca nakladke - pobiera aktualny stan i aktualizuje GUI
+def refresh_overlay(delay=0.1):
+    time.sleep(delay) 
+    try:
+        current = sp.current_playback()
+        if current and current['item']:
+            track = current['item']['name']
+            art = ", ".join([a['name'] for a in current['item']['artists']])
+            vol = current['device']['volume_percent']
+            cover = current['item']['album']['images'][0]['url'] if current['item']['album']['images'] else None
             
-            if current and current['item']:
-                current_id = current['item']['id']
-                
-                # CZY TO NOWA PIOSENKA?
-                if current_id != last_track_id:
-                    last_track_id = current_id
-                    
-                    # Pobierz dane
-                    track_name = current['item']['name']
-                    artists = ", ".join([a['name'] for a in current['item']['artists']])
-                    vol = current['device']['volume_percent']
-                    cover = current['item']['album']['images'][0]['url'] if current['item']['album']['images'] else None
-                    
-                    # Pokaz overlay
-                    overlay.root.after(0, lambda: overlay.update_info(track_name, artists, vol, cover))
-            
-            # Odczekaj chwile przed kolejnym sprawdzeniem (oszczedzanie procesora)
-            time.sleep(1.5) 
-            
-        except Exception as e:
-            # Ignoruj bledy polaczenia (np. brak neta przez chwile)
-            time.sleep(5)
+            # Zleć aktualizację GUI
+            overlay.root.after(0, lambda: overlay.update_info(track, art, vol, cover))
+    except:
+        pass
 
-# Uruchom monitor w tle
-threading.Thread(target=monitor_loop, daemon=True).start()
-
-
-# --- STEROWANIE GŁOŚNOŚCIĄ (Twoje skróty) ---
+# sterowanie glosnoscia (skroty klawiszowe)
 def change_volume(step):
     threading.Thread(target=worker_volume, args=(step,), daemon=True).start()
 
@@ -153,7 +151,7 @@ def worker_volume(step):
             new_vol = max(0, min(100, vol + step))
             sp.volume(int(new_vol))
             
-            # Przy zmianie glosnosci tez odswiezamy GUI
+            # przy zmianie glosnosci tez odswiezamy GUI
             track = current['item']['name']
             art = ", ".join([a['name'] for a in current['item']['artists']])
             cover = current['item']['album']['images'][0]['url'] if current['item']['album']['images'] else None
@@ -162,9 +160,25 @@ def worker_volume(step):
     except:
         pass
 
-# Skróty tylko do głośności (reszte robi Monitor)
+# rejestracja skrótów klawiszowych
 keyboard.add_hotkey('ctrl+alt+up', lambda: change_volume(5))
 keyboard.add_hotkey('ctrl+alt+down', lambda: change_volume(-5))
 
-# Start
+# funkcja wywoływana przy naciśnięciu klawiszy multimedialnych
+def on_any_key(event):
+    if event.event_type == 'down': # reagujemy tylko na naciśnięcia, nie na zwolnienia
+        name = event.name.lower()
+        
+        # definiujemy słowa kluczowe, które mogą występować w nazwach klawiszy multimedialnych
+        keywords = ['track', 'media', 'play', 'pause', 'next', 'previous']
+        
+        # jeśli nazwa klawisza zawiera któreś ze słów kluczowych, odświeżamy nakładkę
+        if any(word in name for word in keywords):
+            # odświeżamy nakładkę w osobnym wątku, żeby nie blokować głównego wątku GUI
+            threading.Thread(target=refresh_overlay, args=(0.5,), daemon=True).start()
+
+# rejestracja globalnego nasłuchiwania klawiszy
+keyboard.hook(on_any_key)
+
+# start GUI
 overlay.start()
