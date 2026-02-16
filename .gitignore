@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.log
+error_log.txt
+.cache
+start.bat
