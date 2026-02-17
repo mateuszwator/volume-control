@@ -67,24 +67,32 @@ class VolumeOverlay:
                                          fg="#1db954", bg="#1f1f1f", anchor="center")
         self.vol_number_label.place(x=0, y=10, width=40)
 
-        # pasek glosnosci (po lewej stronie)
+        # pasek głośności (x=15) - wysokość 80px, szerokość 12px
         self.vol_canvas_height = 80
+        # tło paska: ciemny szary (#404040) zamiast czarnego, aby lepiej kontrastował z jasnoszarym wypełnieniem
         self.vol_canvas = tk.Canvas(self.root, bg="#404040", highlightthickness=0)
-        self.vol_canvas.place(x=13, y=30, width=14, height=self.vol_canvas_height)
-        self.vol_bar = self.vol_canvas.create_rectangle(0, self.vol_canvas_height, 14, self.vol_canvas_height, fill="#1db954", width=0)
+        self.vol_canvas.place(x=15, y=15, width=12, height=self.vol_canvas_height)
+        
+        # początkowy pasek głośności (pełny, ale wypełniony jasnoszarym kolorem #cccccc) - będzie aktualizowany dynamicznie
+        self.vol_bar = self.vol_canvas.create_rectangle(0, self.vol_canvas_height, 12, self.vol_canvas_height, fill="#cccccc", width=0)
 
-        # okladka (po lewej stronie)
+        # liczba procentowa głośności (x=0) - umieszczona nad paskiem, z zielonym kolorem #1db954, aby wyróżniała się na tle ciemnoszarego paska
+        self.vol_number_label = tk.Label(self.root, text="--", font=("Segoe UI", 9), 
+                                         fg="white", bg="#1f1f1f", anchor="center")
+        self.vol_number_label.place(x=0, y=98, width=42)
+
+        # okładka albumu (x=60) - kwadrat 100x100px, umieszczony po lewej stronie nakładki, z ciemnoszarym tłem #1f1f1f, aby lepiej kontrastował z kolorową okładką
         self.cover_label = tk.Label(self.root, bg="#1f1f1f")
-        self.cover_label.place(x=50, y=10, width=100, height=100)
+        self.cover_label.place(x=60, y=10, width=100, height=100)
 
-        # tytul i artysta (po prawej stronie)
+        # tytuł i artysta (x=170) - umieszczone po prawej stronie okładki, z białym kolorem dla tytułu i jasnoszarym dla artysty, aby stworzyć hierarchię wizualną
         self.title_label = tk.Label(self.root, text="Spotify", font=("Segoe UI", 11, "bold"), 
-                                    fg="white", bg="#1f1f1f", anchor="w")
-        self.title_label.place(x=160, y=25, width=200)
+                                    fg="white", bg="#1f1f1f", anchor="nw") 
+        self.title_label.place(x=170, y=10, width=190)
 
         self.artist_label = tk.Label(self.root, text="...", font=("Segoe UI", 9), 
-                                     fg="#b3b3b3", bg="#1f1f1f", anchor="w")
-        self.artist_label.place(x=160, y=50, width=200)
+                                     fg="#b3b3b3", bg="#1f1f1f", anchor="nw")
+        self.artist_label.place(x=170, y=35, width=190)
 
         self.root.withdraw()
         self.current_cover_url = ""
