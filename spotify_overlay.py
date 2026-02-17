@@ -45,7 +45,7 @@ class VolumeOverlay:
         self.root.attributes("-alpha", 0.9) 
         
         self.root.configure(bg="#1f1f1f") 
-        self.root.geometry(f"350x120+50+50") 
+        self.root.geometry(f"370x120+50+50") 
 
         # ustawienia okna na "przenikające" (kliknięcia przechodzą przez nie)
         self.root.update_idletasks() # potrzebne do poprawnego pobrania ID okna
@@ -63,20 +63,28 @@ class VolumeOverlay:
         self.hide_timer = None
 
         # elementy GUI
-        self.cover_label = tk.Label(self.root, bg="#1f1f1f")
-        self.cover_label.place(x=10, y=10, width=100, height=100)
+        self.vol_number_label = tk.Label(self.root, text="--%", font=("Segoe UI", 9, "bold"), 
+                                         fg="#1db954", bg="#1f1f1f", anchor="center")
+        self.vol_number_label.place(x=0, y=10, width=40)
 
-        self.title_label = tk.Label(self.root, text="Spotify", font=("Segoe UI", 12, "bold"), 
-                                    fg="white", bg="#1f1f1f", anchor="w")
-        self.title_label.place(x=120, y=15, width=220)
-
-        self.artist_label = tk.Label(self.root, text="...", font=("Segoe UI", 10), 
-                                     fg="#b3b3b3", bg="#1f1f1f", anchor="w")
-        self.artist_label.place(x=120, y=40, width=220)
-
+        # pasek glosnosci (po lewej stronie)
+        self.vol_canvas_height = 80
         self.vol_canvas = tk.Canvas(self.root, bg="#404040", highlightthickness=0)
-        self.vol_canvas.place(x=120, y=80, width=200, height=6)
-        self.vol_bar = self.vol_canvas.create_rectangle(0, 0, 0, 6, fill="#1db954", width=0)
+        self.vol_canvas.place(x=13, y=30, width=14, height=self.vol_canvas_height)
+        self.vol_bar = self.vol_canvas.create_rectangle(0, self.vol_canvas_height, 14, self.vol_canvas_height, fill="#1db954", width=0)
+
+        # okladka (po lewej stronie)
+        self.cover_label = tk.Label(self.root, bg="#1f1f1f")
+        self.cover_label.place(x=50, y=10, width=100, height=100)
+
+        # tytul i artysta (po prawej stronie)
+        self.title_label = tk.Label(self.root, text="Spotify", font=("Segoe UI", 11, "bold"), 
+                                    fg="white", bg="#1f1f1f", anchor="w")
+        self.title_label.place(x=160, y=25, width=200)
+
+        self.artist_label = tk.Label(self.root, text="...", font=("Segoe UI", 9), 
+                                     fg="#b3b3b3", bg="#1f1f1f", anchor="w")
+        self.artist_label.place(x=160, y=50, width=200)
 
         self.root.withdraw()
         self.current_cover_url = ""
@@ -88,8 +96,13 @@ class VolumeOverlay:
         
         # aktualizacja paska glosnosci
         if volume is not None:
-            bar_width = int(volume * 2) 
-            self.vol_canvas.coords(self.vol_bar, 0, 0, bar_width, 6)
+            # aktualizacja liczby procentowej
+            self.vol_number_label.config(text=f"{int(volume)}%")
+            
+            # aktualizacja paska graficznego
+            bar_height_px = int((volume / 100) * self.vol_canvas_height)
+            top_y = self.vol_canvas_height - bar_height_px
+            self.vol_canvas.coords(self.vol_bar, 0, top_y, 14, self.vol_canvas_height)
 
         # pobierz i ustaw okładkę tylko jeśli się zmieniła
         if cover_url and cover_url != self.current_cover_url:
