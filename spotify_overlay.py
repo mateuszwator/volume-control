@@ -55,6 +55,8 @@ def get_cover_url(item: dict) -> str | None:
     idx = min(1, len(images) - 1)
     return images[idx]['url']
 
+_last_state: dict | None = None
+
 # główna klasa odpowiedzialna za nakładkę
 class VolumeOverlay:
     def __init__(self):
@@ -85,9 +87,8 @@ class VolumeOverlay:
 
         # sesja do pobierania okładek albumów, aby uniknąć tworzenia nowych połączeń przy każdym pobieraniu
         self.session = requests.Session()
-
-        
-        self.current_cover_url = ""
+        self.current_cover_url = "" 
+        self._pending_cover_url = ""
 
         self._build_widgets()
         self.root.withdraw()
@@ -149,6 +150,7 @@ class VolumeOverlay:
         # pobierz i ustaw okładkę tylko jeśli się zmieniła
         if cover_url and cover_url != self.current_cover_url:
             self.current_cover_url = cover_url
+            self._pending_cover_url = cover_url
             threading.Thread(target=self._download_image, args=(cover_url,), daemon=True).start()
 
         self.root.deiconify()
@@ -167,7 +169,9 @@ class VolumeOverlay:
             # zmniejszenie obrazu do 100x100px, aby pasował do nakładki
             pil_image = pil_image.resize((100, 100), Image.Resampling.LANCZOS)
             tk_image = ImageTk.PhotoImage(pil_image)
-            self.root.after(0, lambda: self._set_image(tk_image))
+             # ignoruj wynik jeśli w międzyczasie zainicjowano pobieranie nowszej okładki
+            if url == self._pending_cover_url:
+                self.root.after(0, lambda: self._set_image(tk_image))
         except Exception as e:
             logging.error(f"Error downloading cover image ({url}): {e}")
 
@@ -184,22 +188,41 @@ class VolumeOverlay:
 overlay = VolumeOverlay()
 
 # zmienne do zarządzania odświeżaniem nakładki, aby uniknąć nadmiernego odświeżania przy szybkim naciskaniu klawiszy multimedialnych
-_refresh_timer: threading.Timer | None = None
-_refresh_lock = threading.Lock()
-
-# funkcja do odświeżania nakładki, która jest wywoływana z wątku nasłuchującego klawisze multimedialne, aby pobrać aktualne informacje o odtwarzaniu i zaktualizować nakładkę
-def _debounced_refresh(delay: float):
-    # używamy blokady, aby zapewnić, że tylko jeden timer odświeżania jest aktywny w danym momencie, co zapobiega nadmiernemu odświeżaniu przy szybkim naciskaniu klawiszy
-    global _refresh_timer
-    with _refresh_lock:
-        if _refresh_timer is not None:
-            _refresh_timer.cancel()
-        _refresh_timer = threading.Timer(delay, _fetch_and_update)
-        _refresh_timer.daemon = True
-        _refresh_timer.start()
+_throttle_lock = threading.Lock()
+_throttle_active = False    # czy aktualnie trwa okno throttlingu
+_throttle_pending = False   # czy przyszło zdarzenie podczas aktywnego okna
+MIN_INTERVAL = 0.4          # minimalna przerwa między zapytaniami do API (s)
+ 
+def _throttled_refresh():
+    global _throttle_active, _throttle_pending
+    with _throttle_lock:
+        if _throttle_active:
+            _throttle_pending = True  # zapamiętaj skip, nie resetuj timera
+            return
+        _throttle_active = True
+        _throttle_pending = False
+ 
+    # jeśli mamy już jakieś dane (np. z poprzedniego odświeżenia), pokaż je od razu, żeby nakładka była responsywna, a aktualizacja z API będzie już w tle
+    if _last_state is not None:
+        overlay.root.after(0, lambda: overlay.update_info(*_last_state))
+ 
+    def _worker():
+        global _throttle_active, _throttle_pending
+        time.sleep(MIN_INTERVAL)   # czekaj na propagację zmiany w Spotify
+        _fetch_and_update()        # pobierz aktualne dane i zaktualizuj
+        with _throttle_lock:
+            pending = _throttle_pending
+            _throttle_active = False
+            _throttle_pending = False
+        if pending:                # było zdarzenie podczas aktywnego throttlingu, więc odśwież ponownie
+            time.sleep(MIN_INTERVAL)
+            _fetch_and_update()
+ 
+    threading.Thread(target=_worker, daemon=True).start()
 
 # funkcja do bezpośredniego odświeżania nakładki, która jest wywoływana z wątku nasłuchującego klawisze multimedialne, aby natychmiast pobrać aktualne informacje o odtwarzaniu i zaktualizować nakładkę, bez opóźnienia debouncingu
 def _fetch_and_update():
+    global _last_state
     try:
         current = sp.current_playback()
         if current and current.get('item'):
@@ -208,6 +231,7 @@ def _fetch_and_update():
             artist = ", ".join(a['name'] for a in item['artists'])
             vol = current['device']['volume_percent']
             cover = get_cover_url(item)
+            _last_state = (track, artist, vol, cover)
             overlay.root.after(0, lambda: overlay.update_info(track, artist, vol, cover))
     except Exception as e:
         logging.error(f"Error fetching and updating overlay: {e}")
@@ -218,6 +242,7 @@ def change_volume(step: int):
 
 # funkcja robocza do zmiany głośności, która jest uruchamiana w osobnym wątku, aby nie blokować głównego wątku GUI podczas komunikacji z API Spotify i aktualizacji nakładki
 def _worker_volume(step: int):
+    global _last_state
     try:
         current = sp.current_playback()
         if not (current and current.get('device')):
@@ -232,6 +257,7 @@ def _worker_volume(step: int):
             track = item['name']
             artist = ", ".join(a['name'] for a in item['artists'])
             cover = get_cover_url(item)
+            _last_state = (track, artist, new_vol, cover)
             overlay.root.after(0, lambda: overlay.update_info(track, artist, new_vol, cover))
     except Exception as e:
         logging.error(f"Error changing volume: {e}")
@@ -251,7 +277,7 @@ def on_any_key(event: keyboard.KeyboardEvent):
     name = event.name.lower()
     # Spotify potrzebuje chwili na propagację zmiany stanu — stąd delay 0.5s
     if any(word in name for word in MEDIA_KEY_KEYWORDS):
-        _debounced_refresh(delay=0.5)
+        _throttled_refresh()
 
 # rejestracja globalnego nasłuchiwania klawiszy
 keyboard.hook(on_any_key)
