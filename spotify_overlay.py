@@ -202,10 +202,6 @@ def _throttled_refresh():
         _throttle_active = True
         _throttle_pending = False
  
-    # jeśli mamy już jakieś dane (np. z poprzedniego odświeżenia), pokaż je od razu, żeby nakładka była responsywna, a aktualizacja z API będzie już w tle
-    if _last_state is not None:
-        overlay.root.after(0, lambda: overlay.update_info(*_last_state))
- 
     def _worker():
         global _throttle_active, _throttle_pending
         time.sleep(MIN_INTERVAL)   # czekaj na propagację zmiany w Spotify
