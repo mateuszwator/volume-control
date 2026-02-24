@@ -55,6 +55,23 @@ def get_cover_url(item: dict) -> str | None:
     idx = min(1, len(images) - 1)
     return images[idx]['url']
 
+# generuje placeholder 100x100 z ikoną nuty dla plików lokalnych, które nie mają okładki albumu, aby nakładka nadal wyglądała estetycznie, nawet gdy brakuje danych o okładce
+def make_local_placeholder() -> Image.Image:
+    from PIL import ImageDraw, ImageFont
+    img = Image.new("RGB", (100, 100), "#2a2a2a")
+    draw = ImageDraw.Draw(img)
+    symbol = "♪"
+    try:
+        font = ImageFont.truetype("seguisym.ttf", 48)
+    except Exception:
+        font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), symbol, font=font)
+    x = (100 - (bbox[2] - bbox[0])) // 2 - bbox[0]
+    y = (100 - (bbox[3] - bbox[1])) // 2 - bbox[1]
+    draw.text((x, y), symbol, fill="#666666", font=font)
+    return img
+
+# zmienna do przechowywania ostatniego stanu odtwarzania, aby uniknąć niepotrzebnych aktualizacji nakładki
 _last_state: dict | None = None
 
 # główna klasa odpowiedzialna za nakładkę
@@ -132,7 +149,7 @@ class VolumeOverlay:
         self.artist_label.place(x=170, y=35, width=190)
 
     # metoda do aktualizacji informacji wyświetlanych na nakładce, która jest wywoływana z głównego wątku GUI, aby zapewnić płynne aktualizacje bez blokowania interfejsu
-    def update_info(self, title, artist, volume, cover_url):
+    def update_info(self, title, artist, volume, cover_url, is_local=False):
         # aktualizacja tekstow
         self.title_label.config(text=title)
         self.artist_label.config(text=artist)
@@ -148,7 +165,13 @@ class VolumeOverlay:
             self.vol_canvas.coords(self.vol_bar, 0, top_y, 14, self.vol_canvas_height)
 
         # pobierz i ustaw okładkę tylko jeśli się zmieniła
-        if cover_url and cover_url != self.current_cover_url:
+        if is_local and not cover_url:
+            # plik lokalny bez okładki – generuj placeholder w osobnym wątku
+            if self.current_cover_url != "__local_placeholder__":
+                self.current_cover_url = "__local_placeholder__"
+                self._pending_cover_url = "__local_placeholder__"
+                threading.Thread(target=self._set_local_placeholder, daemon=True).start()
+        elif cover_url and cover_url != self.current_cover_url:
             self.current_cover_url = cover_url
             self._pending_cover_url = cover_url
             threading.Thread(target=self._download_image, args=(cover_url,), daemon=True).start()
@@ -159,6 +182,16 @@ class VolumeOverlay:
         if self.hide_timer:
             self.root.after_cancel(self.hide_timer)
         self.hide_timer = self.root.after(3000, self.root.withdraw)
+
+    # metoda go generowania lokalnego placeholdera
+    def _set_local_placeholder(self):
+        try:
+            pil_image = make_local_placeholder()
+            tk_image = ImageTk.PhotoImage(pil_image)
+            if self._pending_cover_url == "__local_placeholder__":
+                self.root.after(0, lambda: self._set_image(tk_image))
+        except Exception as e:
+            logging.error(f"Error creating local placeholder: {e}")
 
     # metoda do pobierania obrazu z URL i aktualizacji nakładki, która jest uruchamiana w osobnym wątku, aby nie blokować głównego wątku GUI podczas pobierania i przetwarzania obrazu
     def _download_image(self, url):
@@ -191,7 +224,7 @@ overlay = VolumeOverlay()
 _throttle_lock = threading.Lock()
 _throttle_active = False    # czy aktualnie trwa okno throttlingu
 _throttle_pending = False   # czy przyszło zdarzenie podczas aktywnego okna
-MIN_INTERVAL = 0.4          # minimalna przerwa między zapytaniami do API (s)
+MIN_INTERVAL = 0.5          # minimalna przerwa między zapytaniami do API (s)
  
 def _throttled_refresh():
     global _throttle_active, _throttle_pending
@@ -227,8 +260,9 @@ def _fetch_and_update():
             artist = ", ".join(a['name'] for a in item['artists'])
             vol = current['device']['volume_percent']
             cover = get_cover_url(item)
-            _last_state = (track, artist, vol, cover)
-            overlay.root.after(0, lambda: overlay.update_info(track, artist, vol, cover))
+            is_local = item.get('is_local', False)
+            _last_state = (track, artist, vol, cover, is_local)
+            overlay.root.after(0, lambda: overlay.update_info(track, artist, vol, cover, is_local))
     except Exception as e:
         logging.error(f"Error fetching and updating overlay: {e}")
 
@@ -253,8 +287,9 @@ def _worker_volume(step: int):
             track = item['name']
             artist = ", ".join(a['name'] for a in item['artists'])
             cover = get_cover_url(item)
-            _last_state = (track, artist, new_vol, cover)
-            overlay.root.after(0, lambda: overlay.update_info(track, artist, new_vol, cover))
+            is_local = item.get('is_local', False)
+            _last_state = (track, artist, new_vol, cover, is_local)
+            overlay.root.after(0, lambda: overlay.update_info(track, artist, new_vol, cover, is_local))
     except Exception as e:
         logging.error(f"Error changing volume: {e}")
 
