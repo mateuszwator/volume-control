@@ -3,9 +3,10 @@ basic app made in python for controlling in app volume with global shortcuts usi
 
 ## features
 * volume control: shortcuts `Ctrl` + `Alt` + `Arrow Up/Down` for changing volume in app by 5%, add `Shift` for 1% steps. the overlay reacts instantly, fast/held presses are merged into a single API request.
-* overlay: shows album cover, title (up to 2 lines), artist, play/pause state with track progress and volume bar, fades in/out and autohides after 3 seconds
+* overlay: styled after the Windows media flyout – volume slider in a separate column, album cover, large title, artist, album (hidden for singles where it matches the title), play/pause state with track progress, blurred cover as the background; fades in/out and autohides after 3 seconds. it's display-only, clicks pass through it
 * media keys: overlay shows up after play/pause/next/previous
 * podcasts: episodes are shown with the show name and cover
+* local files: the cover is read from the file itself (MP3, FLAC, M4A, Ogg) or from `cover.jpg` / `folder.jpg` next to it; files are found through Spotify's own local files index, so no setup is needed. if the file has no cover, the track is looked up in the Spotify catalog (same title and artist)
 * clear messages instead of silent failures: no active device, no internet connection, Spotify Premium required, login required
 * tray icon: connection status (green / red / grey), show overlay, log in again, start with Windows, open log, quit
 * automatic re-login in the browser when the Spotify token expires or gets revoked
@@ -27,7 +28,7 @@ basic app made in python for controlling in app volume with global shortcuts usi
 
 2. 
     ```bash
-    pip install spotipy keyboard pillow requests python-dotenv pystray
+    pip install spotipy keyboard pillow requests python-dotenv pystray mutagen
     ```
 
 3.  **configure spotify API:**
@@ -59,6 +60,11 @@ basic app made in python for controlling in app volume with global shortcuts usi
 | `OVERLAY_TIMEOUT` | `3` | seconds before the overlay hides |
 | `OVERLAY_OPACITY` | `0.96` | overlay opacity (0.2–0.99) |
 | `OVERLAY_FADE_MS` | `150` | fade in/out duration in ms (`0` disables it) |
+| `OVERLAY_ACCENT` | `#0078d4` | color of the volume and progress bars: `#rrggbb` or `system` (Windows accent color) |
+| `OVERLAY_BLUR` | `true` | blurred album cover as the overlay background |
+| `LOCAL_COVERS` | `true` | show covers for local files |
+| `LOCAL_COVERS_ONLINE` | `true` | if a local file has no cover, look the track up in the Spotify catalog |
+| `LOCAL_MUSIC_DIRS` | *(empty)* | extra music folders searched recursively, separated with `;` (folders added in Spotify are found automatically) |
 
 ## for windowless running in background:
 1.  make a start.bat file with:

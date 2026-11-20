@@ -1,8 +1,11 @@
+import base64
 import ctypes
 import ctypes.wintypes
+import glob
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -15,11 +18,12 @@ from io import BytesIO
 from logging.handlers import RotatingFileHandler
 
 import keyboard
+import mutagen
 import pystray
 import requests
 import spotipy
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageTk
 from spotipy.exceptions import SpotifyException
 from spotipy.oauth2 import SpotifyOAuth, SpotifyOauthError, SpotifyStateError, start_local_http_server
 
@@ -106,6 +110,40 @@ def _env_number(name: str, default, lo, hi, cast):
     return value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on", "tak"):
+        return True
+    if raw in ("0", "false", "no", "off", "nie"):
+        return False
+    logging.warning(f"Nieprawidłowa wartość {name}={raw!r} (dozwolone: true/false), używam {default}")
+    return default
+
+
+def _system_accent() -> str | None:
+    # kolor akcentu z ustawień Windows (zapisany jako 0xAABBGGRR)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM") as key:
+            value = winreg.QueryValueEx(key, "AccentColor")[0] & 0xFFFFFFFF
+        return f"#{value & 0xFF:02x}{(value >> 8) & 0xFF:02x}{(value >> 16) & 0xFF:02x}"
+    except OSError:
+        return None
+
+
+def _env_color(name: str, default: str) -> str:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw == "system":
+        return _system_accent() or default
+    if re.fullmatch(r"#?[0-9a-f]{6}", raw):
+        return "#" + raw.lstrip("#")
+    logging.warning(f"Nieprawidłowy kolor {name}={raw!r} (np. #0078d4 albo system), używam {default}")
+    return default
+
+
 def _env_choice(name: str, default: str, choices: set[str]) -> str:
     raw = os.getenv(name, "").strip().lower()
     if not raw:
@@ -137,6 +175,14 @@ OVERLAY_MARGIN = _env_number("OVERLAY_MARGIN", 50, 0, 2000, int)
 # maks. 0.99 – przy alpha = 1.0 Tk zdejmuje z okna styl WS_EX_LAYERED i kliknięcia przestają przez nie przechodzić
 OVERLAY_OPACITY = _env_number("OVERLAY_OPACITY", 0.96, 0.2, 0.99, float)
 OVERLAY_FADE_MS = _env_number("OVERLAY_FADE_MS", 150, 0, 2000, int)
+# kolor paska głośności i postępu: #rrggbb albo "system" (akcent z ustawień Windows); domyślnie niebieski Windows
+OVERLAY_ACCENT = _env_color("OVERLAY_ACCENT", "#0078d4")
+OVERLAY_BLUR = _env_bool("OVERLAY_BLUR", True)  # rozmyta okładka jako tło nakładki
+# okładki plików lokalnych: z samego pliku, a gdy jej brak – wyszukiwanie w katalogu Spotify
+LOCAL_COVERS = _env_bool("LOCAL_COVERS", True)
+LOCAL_COVERS_ONLINE = _env_bool("LOCAL_COVERS_ONLINE", True)
+# dodatkowe foldery z muzyką (przeszukiwane rekurencyjnie), oddzielone średnikiem
+LOCAL_MUSIC_DIRS = [d.strip() for d in os.getenv("LOCAL_MUSIC_DIRS", "").split(";") if d.strip()]
 
 if not all([CLIENT_ID, CLIENT_SECRET, REDIRECT_URI]):
     logging.critical("Brak zmiennych SPOTIPY_CLIENT_ID / SPOTIPY_CLIENT_SECRET / SPOTIPY_REDIRECT_URI w .env")
@@ -256,6 +302,8 @@ class Playback:
     progress_ms: int
     duration_ms: int
     fetched_at: float           # time.monotonic() w chwili pobrania – do lokalnego liczenia postępu
+    is_local: bool = False      # plik lokalny – API nie zwraca dla niego okładki
+    album: str = ""
 
     # po tym rozpoznajemy, czy klawisz multimedialny już "zadziałał" po stronie API
     @property
@@ -302,7 +350,282 @@ def parse_playback(data: dict | None) -> Playback | None:
         progress_ms=data.get("progress_ms") or 0,
         duration_ms=item.get("duration_ms") or 0,
         fetched_at=time.monotonic(),
+        is_local=bool(item.get("is_local")),
+        album=(item.get("album") or {}).get("name") or "",
     )
+
+
+# ---------------------------------------------------------------------------
+# okładki plików lokalnych
+# ---------------------------------------------------------------------------
+
+AUDIO_EXTENSIONS = (".mp3", ".m4a", ".mp4", ".aac", ".flac", ".ogg", ".opus", ".wav")
+FOLDER_COVER_NAMES = ("cover", "folder", "front", "album")
+SPOTIFY_USERS_DIR = os.path.join(os.environ.get("APPDATA", ""), "Spotify", "Users")
+_LOCAL_PATH_RE = re.compile(
+    r"[A-Za-z]:\\[^\x00-\x1f�]{1,260}?\.(?:" + "|".join(e[1:] for e in AUDIO_EXTENSIONS) + r")(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _clean(text: str) -> str:
+    return " ".join(re.sub(r"[\W_]+", " ", text.casefold()).split())
+
+
+# normalizacja tytułu do porównań: bez wielkości liter, interpunkcji, "(feat. ...)", "[Remastered]" itp.
+def _norm(text: str) -> str:
+    text = text or ""
+    stripped = re.sub(r"[\(\[].*?[\)\]]", " ", text)
+    stripped = re.sub(r"\b(feat|ft|featuring)\b.*", " ", stripped, flags=re.IGNORECASE)
+    return _clean(stripped) or _clean(text)
+
+
+def _artist_set(text: str) -> set[str]:
+    parts = re.split(r",|&|;|/|\bx\b|\bfeat\b\.?|\bft\b\.?|\bfeaturing\b|\bwith\b", (text or "").casefold())
+    return {c for c in (_clean(p) for p in parts) if c}
+
+
+# warianty nazwy pliku: "05 - Tytuł", "05.-Tytuł", "Wykonawca - Tytuł"
+def _filename_titles(path: str) -> set[str]:
+    stem = os.path.splitext(os.path.basename(path))[0]
+    no_number = re.sub(r"^\s*\d{1,3}\s*[.\-_)]*\s*", "", stem)
+    variants = {_norm(stem), _norm(no_number)}
+    if " - " in no_number:
+        variants.add(_norm(no_number.split(" - ")[-1]))
+    return {v for v in variants if v}
+
+
+@dataclass
+class LocalTrack:
+    path: str
+    titles: set[str]        # tytuł z tagów + warianty nazwy pliku
+    artists: set[str]
+    album: str
+    duration_ms: int
+    tag_artist: str
+    tag_album: str
+
+
+# Spotify nie podaje przez API ani okładki, ani ścieżki pliku lokalnego, ale trzyma własny indeks
+# (local-files.bnk) ze ścieżkami. Na tej podstawie znajdujemy plik po tagach i wyciągamy z niego okładkę.
+class LocalCoverResolver:
+    RESCAN_INTERVAL = 60.0  # s – najczęściej tak skanujemy foldery ponownie, gdy utwór nie zostanie znaleziony
+
+    def __init__(self, extra_dirs: list[str], online: bool):
+        self.extra_dirs = extra_dirs
+        self.online = online
+        self._lock = threading.RLock()
+        self._tracks: list[LocalTrack] = []
+        self._scanned_at = 0.0
+        self._index_state = 0.0
+        self._results: dict[tuple, tuple[str | None, str | None, str | None]] = {}
+        self._images: "OrderedDict[str, Image.Image | None]" = OrderedDict()
+
+    @staticmethod
+    def _index_files() -> list[str]:
+        return glob.glob(os.path.join(SPOTIFY_USERS_DIR, "*", "local-files.bnk"))
+
+    def _current_index_state(self) -> float:
+        times = [os.path.getmtime(f) for f in self._index_files() if os.path.exists(f)]
+        return max(times, default=0.0)
+
+    # foldery, w których Spotify ma pliki lokalne (wyciągnięte ze ścieżek w jego indeksie)
+    def _spotify_dirs(self) -> set[str]:
+        dirs = set()
+        for index_file in self._index_files():
+            try:
+                with open(index_file, "rb") as f:
+                    text = f.read().decode("utf-8", "replace")
+            except OSError:
+                continue
+            dirs.update(os.path.dirname(p) for p in _LOCAL_PATH_RE.findall(text))
+        return {d for d in dirs if os.path.isdir(d)}
+
+    def _audio_files(self) -> list[str]:
+        files = set()
+        for folder in self._spotify_dirs():
+            try:
+                files.update(os.path.join(folder, n) for n in os.listdir(folder) if n.lower().endswith(AUDIO_EXTENSIONS))
+            except OSError:
+                pass
+        for folder in self.extra_dirs:
+            for root, _, names in os.walk(folder):
+                files.update(os.path.join(root, n) for n in names if n.lower().endswith(AUDIO_EXTENSIONS))
+        return sorted(files)
+
+    @staticmethod
+    def _read_track(path: str) -> LocalTrack:
+        title = artist = album = ""
+        duration_ms = 0
+        try:
+            f = mutagen.File(path, easy=True)
+            if f is not None:
+                tags = f.tags or {}
+                first = lambda key: str((tags.get(key) or [""])[0])
+                title, artist, album = first("title"), first("artist"), first("album")
+                duration_ms = int(getattr(f.info, "length", 0) * 1000)
+        except Exception as e:
+            logging.info(f"Nie udało się odczytać tagów {path}: {e}")
+        titles = _filename_titles(path)
+        if title:
+            titles.add(_norm(title))
+        return LocalTrack(path, titles, _artist_set(artist), _norm(album), duration_ms, artist, album)
+
+    def scan(self):
+        started = time.monotonic()
+        state = self._current_index_state()
+        tracks = [self._read_track(p) for p in self._audio_files()]
+        with self._lock:
+            self._tracks = tracks
+            self._scanned_at = time.monotonic()
+            self._index_state = state
+        logging.info(f"Pliki lokalne: zindeksowano {len(tracks)} w {time.monotonic() - started:.1f} s")
+
+    def _match(self, p: Playback) -> LocalTrack | None:
+        title = _norm(p.title)
+        artists = _artist_set(p.artist)
+        album = _norm(p.album)
+        best, best_score = None, -1
+        for track in self._tracks:
+            if title not in track.titles:
+                continue
+            score = 0
+            if artists and track.artists & artists:
+                score += 3
+            if p.duration_ms and track.duration_ms and abs(p.duration_ms - track.duration_ms) <= 2500:
+                score += 2
+            if album and track.album == album:
+                score += 1
+            if score > best_score:
+                best, best_score = track, score
+        return best
+
+    @staticmethod
+    def _key(p: Playback) -> tuple:
+        return (_norm(p.title), _norm(p.artist), p.duration_ms // 1000)
+
+    # wynik z pamięci podręcznej albo None, jeśli utworu jeszcze nie sprawdzano
+    def cached(self, p: Playback) -> tuple[str | None, str | None, str | None] | None:
+        with self._lock:
+            return self._results.get(self._key(p))
+
+    # zwraca (klucz okładki, wykonawca z tagów, album z tagów); klucz to "file:<ścieżka>" albo URL z katalogu Spotify
+    def resolve(self, p: Playback) -> tuple[str | None, str | None, str | None]:
+        key = self._key(p)
+        with self._lock:
+            if key in self._results:
+                return self._results[key]
+            if not self._scanned_at:
+                self.scan()
+            track = self._match(p)
+            stale = time.monotonic() - self._scanned_at > self.RESCAN_INTERVAL
+            if (track is None or not os.path.exists(track.path)) and (stale or self._current_index_state() != self._index_state):
+                self.scan()
+                track = self._match(p)
+
+        cover = artist = album = None
+        cacheable = True
+        if track is not None and os.path.exists(track.path):
+            artist = track.tag_artist or None
+            album = track.tag_album or None
+            if self.load_image(track.path) is not None:
+                cover = "file:" + track.path
+        if cover is None and self.online:
+            try:
+                cover = self._search_spotify(p)
+            except Exception as e:
+                logging.info(f"Wyszukiwanie okładki w Spotify nie powiodło się: {e}")
+                cacheable = False  # spróbujemy ponownie przy następnym odtworzeniu
+        result = (cover, artist, album)
+        if cacheable:
+            with self._lock:
+                self._results[key] = result
+        return result
+
+    # szukamy utworu w katalogu Spotify – akceptujemy tylko trafienie z tym samym tytułem i wykonawcą
+    @staticmethod
+    def _search_spotify(p: Playback) -> str | None:
+        artists = _artist_set(p.artist)
+        if not artists or not p.title:
+            return None
+        main_artist = re.split(r",|&|;", p.artist)[0].strip()
+        results = sp.search(q=f"track:{p.title} artist:{main_artist}", type="track", limit=10)
+        title = _norm(p.title)
+        for item in (results.get("tracks") or {}).get("items") or []:
+            if _norm(item.get("name", "")) != title:
+                continue
+            item_artists = set().union(*(_artist_set(a.get("name", "")) for a in item.get("artists", [])))
+            if not artists & item_artists:
+                continue
+            images = (item.get("album") or {}).get("images") or []
+            if images:
+                return images[min(1, len(images) - 1)]["url"]
+        return None
+
+    # okładka z pliku (ID3 / FLAC / MP4 / Ogg), a gdy jej brak – cover.jpg / folder.jpg w tym samym folderze
+    def load_image(self, path: str) -> Image.Image | None:
+        with self._lock:
+            if path in self._images:
+                self._images.move_to_end(path)
+                return self._images[path]
+        image = None
+        try:
+            data = self._embedded_cover(path)
+            if data:
+                image = Image.open(BytesIO(data))
+                image.load()
+            else:
+                image = self._folder_cover(os.path.dirname(path))
+        except Exception as e:
+            logging.info(f"Nie udało się odczytać okładki {path}: {e}")
+            image = None
+        with self._lock:
+            self._images[path] = image
+            while len(self._images) > 30:
+                self._images.popitem(last=False)
+        return image
+
+    @staticmethod
+    def _embedded_cover(path: str) -> bytes | None:
+        f = mutagen.File(path)
+        if f is None:
+            return None
+        pictures = getattr(f, "pictures", None)  # FLAC
+        if pictures:
+            front = [pic for pic in pictures if pic.type == 3]
+            return (front or pictures)[0].data
+        tags = f.tags
+        if tags is None:
+            return None
+        if hasattr(tags, "getall"):  # ID3 (MP3, WAV)
+            apics = tags.getall("APIC")
+            if apics:
+                front = [a for a in apics if a.type == 3]
+                return (front or apics)[0].data
+            return None
+        if "covr" in tags and tags["covr"]:  # MP4 / M4A
+            return bytes(tags["covr"][0])
+        if "metadata_block_picture" in tags:  # Ogg Vorbis / Opus
+            from mutagen.flac import Picture
+            return Picture(base64.b64decode(tags["metadata_block_picture"][0])).data
+        return None
+
+    @staticmethod
+    def _folder_cover(folder: str) -> Image.Image | None:
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return None
+        for name in names:
+            stem, ext = os.path.splitext(name.lower())
+            if stem in FOLDER_COVER_NAMES and ext in (".jpg", ".jpeg", ".png"):
+                image = Image.open(os.path.join(folder, name))
+                image.load()
+                return image
+        return None
+
+
+local_covers = LocalCoverResolver(LOCAL_MUSIC_DIRS, LOCAL_COVERS_ONLINE) if LOCAL_COVERS else None
 
 
 # ---------------------------------------------------------------------------
@@ -490,10 +813,32 @@ def ui(fn):
 # ---------------------------------------------------------------------------
 
 BG = "#1f1f1f"
-WIDTH, HEIGHT = 380, 120
-TEXT_X, TEXT_W = 170, 195
+WIDTH, HEIGHT = 400, 120
+VOL_COL_W = 56                          # kolumna głośności po lewej, oddzielona linią (jak we flyoucie Windows)
+VOL_X0, VOL_X1 = 24, 32                 # pasek głośności
+VOL_TOP, VOL_BOTTOM = 14, 88
+COVER_X, COVER_Y, COVER_SIZE = 66, 10, 100
+TEXT_X = COVER_X + COVER_SIZE + 14      # 180
+TEXT_W = WIDTH - TEXT_X - 14            # 206
+STATE_Y = 93                            # środek linii z ikoną stanu i czasem
+PROGRESS_Y = COVER_Y + COVER_SIZE - 3   # dół paska postępu równo z dołem okładki
+LINE = "#3a3a3a"                        # separator i tło pasków
+TEXT_DIM = "#9a9a9a"
+TEXT_STATE = "#c8c8c8"
 PLACEHOLDER = "__placeholder__"
 WARNING = "__warning__"
+
+
+def _font_family(*candidates: str) -> str:
+    families = set(tkfont.families())
+    return next((f for f in candidates if f in families), "Segoe UI")
+
+
+# rozmyta, przyciemniona okładka jako tło części z tekstem
+def make_backdrop(image: Image.Image) -> Image.Image:
+    backdrop = ImageOps.fit(image.convert("RGB"), (WIDTH - VOL_COL_W - 1, HEIGHT), Image.Resampling.LANCZOS)
+    backdrop = backdrop.filter(ImageFilter.GaussianBlur(18))
+    return ImageEnhance.Brightness(backdrop).enhance(0.28)
 
 
 class VolumeOverlay:
@@ -513,7 +858,9 @@ class VolumeOverlay:
         self.root.withdraw()
 
         self.session = requests.Session()  # jedna sesja do pobierania okładek
-        self._covers: "OrderedDict[str, ImageTk.PhotoImage]" = OrderedDict()  # cache okładek (ostatnie 30)
+        # cache: klucz okładki -> (okładka, rozmyte tło lub None), ostatnie 30
+        self._covers: "OrderedDict[str, tuple[ImageTk.PhotoImage, ImageTk.PhotoImage | None]]" = OrderedDict()
+        self._current_images = None  # referencja chroni obrazy przed garbage collectorem
         self._wanted_cover = ""
         self._playback: Playback | None = None
         self._visible = False
@@ -542,40 +889,36 @@ class VolumeOverlay:
         if wanted != style:
             user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, wanted)
 
+    # cała nakładka to jedno płótno – dzięki temu tekst może leżeć na rozmytym tle (etykiety Tk mają pełne tło)
     def _build_widgets(self):
-        self.title_font = tkfont.Font(family="Segoe UI", size=11, weight="bold")
+        light = _font_family("Segoe UI Variable Display Light", "Segoe UI Light")
+        self.title_font = tkfont.Font(family=light, size=16)
+        self.title_font_small = tkfont.Font(family=light, size=12)  # dla tytułów, które nie mieszczą się w 1 linii
+        self.artist_font = tkfont.Font(family=_font_family("Segoe UI Semibold"), size=9)
         self.small_font = tkfont.Font(family="Segoe UI", size=9)
 
-        # pasek głośności (pionowy)
-        self.vol_canvas_height = 80
-        self.vol_canvas = tk.Canvas(self.root, bg="#404040", highlightthickness=0)
-        self.vol_canvas.place(x=15, y=15, width=12, height=self.vol_canvas_height)
-        self.vol_bar = self.vol_canvas.create_rectangle(
-            0, self.vol_canvas_height, 12, self.vol_canvas_height, fill="#cccccc", width=0
-        )
+        c = self.canvas = tk.Canvas(self.root, width=WIDTH, height=HEIGHT, bg=BG, highlightthickness=0, bd=0)
+        c.place(x=0, y=0)
+        self.backdrop_item = c.create_image(VOL_COL_W + 1, 0, anchor="nw")
+        c.create_line(VOL_COL_W, 0, VOL_COL_W, HEIGHT, fill=LINE)
 
-        # wartość procentowa głośności – pod paskiem
-        self.vol_number_label = tk.Label(self.root, text="--", font=self.small_font, fg="white", bg=BG, anchor="center")
-        self.vol_number_label.place(x=0, y=98, width=42)
+        # głośność: szara szyna, wypełnienie w kolorze akcentu, biały suwak i liczba pod spodem
+        c.create_rectangle(VOL_X0, VOL_TOP, VOL_X1, VOL_BOTTOM, fill="#5a5a5a", width=0)
+        self.vol_fill = c.create_rectangle(VOL_X0, VOL_BOTTOM, VOL_X1, VOL_BOTTOM, fill=OVERLAY_ACCENT, width=0)
+        self.vol_thumb = c.create_rectangle(0, 0, 0, 0, fill="#f0f0f0", width=0, state="hidden")
+        self.vol_text = c.create_text((VOL_X0 + VOL_X1) // 2, 103, text="--", fill="white", font=self.small_font)
 
-        # okładka
-        self.cover_label = tk.Label(self.root, bg=BG)
-        self.cover_label.place(x=60, y=10, width=100, height=100)
+        self.cover_item = c.create_image(COVER_X, COVER_Y, anchor="nw")
 
-        # tytuł (do 2 linii) i wykonawca
-        self.title_label = tk.Label(self.root, text="Spotify", font=self.title_font, fg="white", bg=BG,
-                                    anchor="nw", justify="left")
-        self.title_label.place(x=TEXT_X, y=8, width=TEXT_W)
-        self.artist_label = tk.Label(self.root, text="", font=self.small_font, fg="#b3b3b3", bg=BG, anchor="nw")
-        self.artist_label.place(x=TEXT_X, y=32, width=TEXT_W)
+        self.title_item = c.create_text(TEXT_X, 8, anchor="nw", text="", fill="white", font=self.title_font)
+        self.artist_item = c.create_text(TEXT_X, 40, anchor="nw", text="", fill="white", font=self.artist_font)
+        self.album_item = c.create_text(TEXT_X, 57, anchor="nw", text="", fill=TEXT_DIM, font=self.small_font)
 
-        # stan odtwarzania: rysowana ikona play/pauza + czas, a pod spodem pasek postępu
-        self.state_icon = tk.Canvas(self.root, width=10, height=10, bg=BG, highlightthickness=0)
-        self.state_label = tk.Label(self.root, text="", font=self.small_font, fg="#b3b3b3", bg=BG, anchor="nw")
-        self.state_label.place(x=TEXT_X + 16, y=80, width=TEXT_W - 16)
-        self.progress_canvas = tk.Canvas(self.root, bg="#404040", highlightthickness=0)
-        self.progress_canvas.place(x=TEXT_X, y=104, width=TEXT_W, height=4)
-        self.progress_bar = self.progress_canvas.create_rectangle(0, 0, 0, 4, fill="#cccccc", width=0)
+        self.time_item = c.create_text(TEXT_X + 16, STATE_Y, anchor="w", text="", fill=TEXT_STATE, font=self.small_font)
+        self.progress_track = c.create_rectangle(TEXT_X, PROGRESS_Y, TEXT_X + TEXT_W, PROGRESS_Y + 3,
+                                                 fill=LINE, width=0, state="hidden")
+        self.progress_fill = c.create_rectangle(TEXT_X, PROGRESS_Y, TEXT_X, PROGRESS_Y + 3,
+                                                fill=OVERLAY_ACCENT, width=0, state="hidden")
 
     # przetwarza zadania wrzucone przez inne wątki
     def _pump(self):
@@ -595,7 +938,7 @@ class VolumeOverlay:
     def show_playback(self, playback: Playback):
         self._playback = playback
         self._set_volume(playback.volume)
-        self._set_texts(playback.title, playback.artist)
+        self._set_texts(playback.title, playback.artist, playback.album)
         self._set_cover(playback.cover_url or PLACEHOLDER)
         self._update_progress()
         self._show()
@@ -612,60 +955,91 @@ class VolumeOverlay:
         self._update_progress()
         self._show()
 
+    # wynik wyszukania okładki pliku lokalnego (przychodzi chwilę po pokazaniu nakładki)
+    def apply_local_result(self, track_id: str | None, cover: str | None, artist: str | None, album: str | None):
+        p = self._playback
+        if p is None or p.track_id != track_id:
+            return  # w międzyczasie zmienił się utwór
+        p.cover_url = cover
+        if (artist and not p.artist) or (album and not p.album):
+            p.artist = p.artist or artist or ""
+            p.album = p.album or album or ""
+            self._set_texts(p.title, p.artist, p.album)
+        if cover:
+            self._set_cover(cover)
+
     # ---- elementy nakładki ----
 
     def _set_volume(self, volume: int | None):
+        c = self.canvas
         if volume is None:
-            self.vol_number_label.config(text="--")
-            self.vol_canvas.coords(self.vol_bar, 0, self.vol_canvas_height, 12, self.vol_canvas_height)
+            c.itemconfigure(self.vol_text, text="--")
+            c.coords(self.vol_fill, VOL_X0, VOL_BOTTOM, VOL_X1, VOL_BOTTOM)
+            c.itemconfigure(self.vol_thumb, state="hidden")
             return
-        self.vol_number_label.config(text=f"{int(volume)}%")
-        top_y = self.vol_canvas_height - int(volume / 100 * self.vol_canvas_height)
-        self.vol_canvas.coords(self.vol_bar, 0, top_y, 12, self.vol_canvas_height)
+        y = VOL_BOTTOM - (VOL_BOTTOM - VOL_TOP) * volume / 100
+        c.coords(self.vol_fill, VOL_X0, y, VOL_X1, VOL_BOTTOM)
+        c.coords(self.vol_thumb, VOL_X0 - 4, y - 3, VOL_X1 + 4, y + 3)
+        c.itemconfigure(self.vol_thumb, state="normal")
+        c.itemconfigure(self.vol_text, text=str(int(volume)))
 
-    def _set_texts(self, title: str, subtitle: str):
-        title_text = fit_lines(self.title_font, title, TEXT_W, max_lines=2)
-        self.title_label.config(text=title_text)
-        lines = title_text.count("\n") + 1
-        self.artist_label.place_configure(y=8 + lines * self.title_font.metrics("linespace") + 2)
-        self.artist_label.config(text=ellipsize(self.small_font, subtitle, TEXT_W))
+    def _set_texts(self, title: str, subtitle: str, album: str = ""):
+        c = self.canvas
+        # duży, cienki tytuł jak w Windows; dłuższy – mniejszą czcionką w 2 liniach
+        if self.title_font.measure(title) <= TEXT_W:
+            font, text = self.title_font, title
+        else:
+            font, text = self.title_font_small, fit_lines(self.title_font_small, title, TEXT_W, max_lines=2)
+        c.itemconfigure(self.title_item, text=text, font=font)
+        y = 8 + (text.count("\n") + 1) * font.metrics("linespace") + 2
+        c.coords(self.artist_item, TEXT_X, y)
+        c.itemconfigure(self.artist_item, text=ellipsize(self.artist_font, subtitle, TEXT_W))
+
+        # album pod wykonawcą – pomijamy pusty, taki sam jak tytuł (single) albo gdy nie zmieści się nad linią czasu
+        album_y = y + self.artist_font.metrics("linespace") + 2
+        fits = album_y + self.small_font.metrics("linespace") <= STATE_Y - 8
+        if album and _norm(album) != _norm(title) and fits:
+            c.coords(self.album_item, TEXT_X, album_y)
+            c.itemconfigure(self.album_item, text=ellipsize(self.small_font, album, TEXT_W))
+        else:
+            c.itemconfigure(self.album_item, text="")
 
     def _update_progress(self):
         if self._tick_job:
             self.root.after_cancel(self._tick_job)
             self._tick_job = None
+        c = self.canvas
+        c.delete("state_icon")
         p = self._playback
         if p is None:
-            self.state_label.config(text="")
-            self.state_icon.place_forget()
-            self.progress_canvas.place_forget()
+            c.itemconfigure(self.time_item, text="")
+            c.itemconfigure(self.progress_track, state="hidden")
+            c.itemconfigure(self.progress_fill, state="hidden")
             return
         self._draw_state_icon(p.is_playing)
         progress = p.progress_now()
         if p.duration_ms:
-            self.state_label.config(text=f"{format_ms(progress)} / {format_ms(p.duration_ms)}")
-            self.progress_canvas.place(x=TEXT_X, y=104, width=TEXT_W, height=4)
-            self.progress_canvas.coords(self.progress_bar, 0, 0, int(TEXT_W * progress / p.duration_ms), 4)
+            c.itemconfigure(self.time_item, text=f"{format_ms(progress)} / {format_ms(p.duration_ms)}")
+            c.coords(self.progress_fill, TEXT_X, PROGRESS_Y, TEXT_X + TEXT_W * progress / p.duration_ms, PROGRESS_Y + 3)
+            c.itemconfigure(self.progress_track, state="normal")
+            c.itemconfigure(self.progress_fill, state="normal")
         else:
-            self.state_label.config(text="")
-            self.progress_canvas.place_forget()
+            c.itemconfigure(self.time_item, text="")
+            c.itemconfigure(self.progress_track, state="hidden")
+            c.itemconfigure(self.progress_fill, state="hidden")
         # postęp liczymy lokalnie, bez dodatkowych zapytań do API
         if p.is_playing and self._visible:
             self._tick_job = self.root.after(500, self._update_progress)
 
     # pokazujemy stan, który jest teraz: trójkąt = gra, dwie kreski = pauza
     def _draw_state_icon(self, playing: bool):
-        c = self.state_icon
-        c.delete("all")
-        color = "#b3b3b3"
+        c = self.canvas
+        x, y = TEXT_X + 1, STATE_Y - 5
         if playing:
-            c.create_polygon(1, 0, 1, 10, 10, 5, fill=color, outline="")
+            c.create_polygon(x, y, x, y + 10, x + 9, y + 5, fill=TEXT_STATE, outline="", tags="state_icon")
         else:
-            c.create_rectangle(1, 0, 4, 10, fill=color, width=0)
-            c.create_rectangle(6, 0, 9, 10, fill=color, width=0)
-        # wyśrodkowanie ikony względem cyfr czasu (+2 px to wewnętrzny odstęp etykiety)
-        y = 80 + 2 + (self.small_font.metrics("linespace") - 10) // 2
-        c.place(x=TEXT_X + 1, y=y, width=10, height=10)
+            c.create_rectangle(x, y, x + 3, y + 10, fill=TEXT_STATE, width=0, tags="state_icon")
+            c.create_rectangle(x + 5, y, x + 8, y + 10, fill=TEXT_STATE, width=0, tags="state_icon")
 
     def _set_cover(self, key: str):
         self._wanted_cover = key
@@ -683,32 +1057,42 @@ class VolumeOverlay:
 
     def _download_cover(self, url: str):
         try:
-            response = self.session.get(url, timeout=5)
-            response.raise_for_status()
-            image = Image.open(BytesIO(response.content)).convert("RGB").resize((100, 100), Image.Resampling.LANCZOS)
+            if url.startswith("file:"):
+                image = local_covers.load_image(url[5:]) if local_covers else None
+                if image is None:
+                    raise ValueError("brak okładki w pliku")
+            else:
+                response = self.session.get(url, timeout=5)
+                response.raise_for_status()
+                image = Image.open(BytesIO(response.content))
+            image = image.convert("RGB")
+            backdrop = make_backdrop(image) if OVERLAY_BLUR else None
+            # przycięcie do kwadratu (okładki z plików nie zawsze są kwadratowe)
+            cover = ImageOps.fit(image, (COVER_SIZE, COVER_SIZE), Image.Resampling.LANCZOS)
         except Exception as e:
             logging.error(f"Błąd pobierania okładki ({url}): {e}")
-            image = None
-        ui(lambda: self._cover_downloaded(url, image))
+            cover = backdrop = None
+        ui(lambda: self._cover_downloaded(url, cover, backdrop))
 
-    def _cover_downloaded(self, url: str, image: Image.Image | None):
-        if image is None:
+    def _cover_downloaded(self, url: str, cover: Image.Image | None, backdrop: Image.Image | None):
+        if cover is None:
             if self._wanted_cover == url:
                 self._set_cover(PLACEHOLDER)
             return
-        self._store_cover(url, image)
+        self._store_cover(url, cover, backdrop)
         if self._wanted_cover == url:  # ignoruj, jeśli w międzyczasie zmienił się utwór
             self._apply_cover(url)
 
-    def _store_cover(self, key: str, image: Image.Image):
-        self._covers[key] = ImageTk.PhotoImage(image)
+    def _store_cover(self, key: str, cover: Image.Image, backdrop: Image.Image | None = None):
+        self._covers[key] = (ImageTk.PhotoImage(cover), ImageTk.PhotoImage(backdrop) if backdrop else None)
         while len(self._covers) > 30:
             self._covers.popitem(last=False)
 
     def _apply_cover(self, key: str):
-        img = self._covers[key]
-        self.cover_label.config(image=img)
-        self.cover_label.image = img  # referencja chroni obraz przed garbage collectorem
+        cover, backdrop = self._covers[key]
+        self.canvas.itemconfigure(self.cover_item, image=cover)
+        self.canvas.itemconfigure(self.backdrop_item, image=backdrop or "")
+        self._current_images = (cover, backdrop)
 
     # ---- pokazywanie / ukrywanie z płynnym przejściem ----
 
@@ -779,7 +1163,31 @@ def publish(playback: Playback, sync_volume: bool = True):
     _last_signature = playback.signature
     if sync_volume:
         volume_ctl.sync(playback.volume)
+
+    # plik lokalny: okładka z pamięci podręcznej od razu, a jeśli utworu jeszcze nie sprawdzano – w tle
+    lookup = False
+    if local_covers and playback.is_local and not playback.cover_url:
+        cached = local_covers.cached(playback)
+        if cached is None:
+            lookup = True
+        else:
+            cover, artist, album = cached
+            playback.cover_url = cover
+            playback.artist = playback.artist or artist or ""
+            playback.album = playback.album or album or ""
+
     ui(lambda: overlay.show_playback(playback))
+    if lookup:
+        threading.Thread(target=_resolve_local_cover, args=(playback,), daemon=True).start()
+
+
+def _resolve_local_cover(playback: Playback):
+    try:
+        cover, artist, album = local_covers.resolve(playback)
+    except Exception as e:
+        logging.error(f"Błąd wyszukiwania okładki pliku lokalnego: {e}")
+        return
+    ui(lambda: overlay.apply_local_result(playback.track_id, cover, artist, album))
 
 
 def show_no_device():
@@ -1110,6 +1518,9 @@ def main():
     keyboard.hook(on_any_key)
 
     threading.Thread(target=startup_check, daemon=True, name="startup").start()
+    if local_covers:
+        # indeks plików lokalnych budujemy od razu w tle, żeby pierwsza okładka pojawiła się bez czekania
+        threading.Thread(target=local_covers.scan, daemon=True, name="local-scan").start()
 
     overlay.start()
     keyboard.unhook_all()
