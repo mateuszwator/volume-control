@@ -3,7 +3,7 @@ basic app made in python for controlling in app volume with global shortcuts usi
 
 ## features
 * volume control: shortcuts `Ctrl` + `Alt` + `Arrow Up/Down` for changing volume in app by 5%, add `Shift` for 1% steps. the overlay reacts instantly, fast/held presses are merged into a single API request.
-* overlay: styled after the Windows media flyout – volume slider in a separate column, album cover, large title, artist, album (hidden for singles where it matches the title), play/pause state with track progress, blurred cover as the background; fades in/out and autohides after 3 seconds. it's display-only, clicks pass through it
+* overlay: styled after the Windows media flyout – thin volume bar matching the progress bar, album cover, large title, artist, album (hidden for singles where it matches the title), play/pause state with track progress, blurred cover as the background; fades in/out and autohides after 3 seconds. it's display-only, clicks pass through it
 * media keys: overlay shows up after play/pause/next/previous
 * podcasts: episodes are shown with the show name and cover
 * local files: the cover is read from the file itself (MP3, FLAC, M4A, Ogg) or from `cover.jpg` / `folder.jpg` next to it; files are found through Spotify's own local files index, so no setup is needed. if the file has no cover, the track is looked up in the Spotify catalog (same title and artist)

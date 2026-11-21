@@ -814,15 +814,16 @@ def ui(fn):
 
 BG = "#1f1f1f"
 WIDTH, HEIGHT = 400, 120
-VOL_COL_W = 56                          # kolumna głośności po lewej, oddzielona linią (jak we flyoucie Windows)
-VOL_X0, VOL_X1 = 24, 32                 # pasek głośności
-VOL_TOP, VOL_BOTTOM = 14, 88
-COVER_X, COVER_Y, COVER_SIZE = 66, 10, 100
-TEXT_X = COVER_X + COVER_SIZE + 14      # 180
-TEXT_W = WIDTH - TEXT_X - 14            # 206
+COVER_X, COVER_Y, COVER_SIZE = 48, 10, 100
+TEXT_X = COVER_X + COVER_SIZE + 14      # 162
+TEXT_W = WIDTH - TEXT_X - 14            # 224
 STATE_Y = 93                            # środek linii z ikoną stanu i czasem
 PROGRESS_Y = COVER_Y + COVER_SIZE - 3   # dół paska postępu równo z dołem okładki
-LINE = "#3a3a3a"                        # separator i tło pasków
+# pionowy pasek głośności na całą wysokość: od góry okładki, liczba pod spodem kończy się równo z dołem okładki
+VOL_X0, VOL_X1 = 20, 28
+VOL_TOP, VOL_BOTTOM = COVER_Y + 3, 90
+VOL_TEXT_Y = COVER_Y + COVER_SIZE - 7
+LINE = "#3a3a3a"                        # tło paska postępu
 TEXT_DIM = "#9a9a9a"
 TEXT_STATE = "#c8c8c8"
 PLACEHOLDER = "__placeholder__"
@@ -834,9 +835,9 @@ def _font_family(*candidates: str) -> str:
     return next((f for f in candidates if f in families), "Segoe UI")
 
 
-# rozmyta, przyciemniona okładka jako tło części z tekstem
+# rozmyta, przyciemniona okładka jako tło całej nakładki
 def make_backdrop(image: Image.Image) -> Image.Image:
-    backdrop = ImageOps.fit(image.convert("RGB"), (WIDTH - VOL_COL_W - 1, HEIGHT), Image.Resampling.LANCZOS)
+    backdrop = ImageOps.fit(image.convert("RGB"), (WIDTH, HEIGHT), Image.Resampling.LANCZOS)
     backdrop = backdrop.filter(ImageFilter.GaussianBlur(18))
     return ImageEnhance.Brightness(backdrop).enhance(0.28)
 
@@ -891,22 +892,21 @@ class VolumeOverlay:
 
     # cała nakładka to jedno płótno – dzięki temu tekst może leżeć na rozmytym tle (etykiety Tk mają pełne tło)
     def _build_widgets(self):
-        light = _font_family("Segoe UI Variable Display Light", "Segoe UI Light")
-        self.title_font = tkfont.Font(family=light, size=16)
-        self.title_font_small = tkfont.Font(family=light, size=12)  # dla tytułów, które nie mieszczą się w 1 linii
-        self.artist_font = tkfont.Font(family=_font_family("Segoe UI Semibold"), size=9)
+        semibold = _font_family("Segoe UI Semibold")
+        self.title_font = tkfont.Font(family=semibold, size=14)
+        self.title_font_small = tkfont.Font(family=semibold, size=11)  # dla tytułów, które nie mieszczą się w 1 linii
+        self.artist_font = tkfont.Font(family=semibold, size=9)
         self.small_font = tkfont.Font(family="Segoe UI", size=9)
 
         c = self.canvas = tk.Canvas(self.root, width=WIDTH, height=HEIGHT, bg=BG, highlightthickness=0, bd=0)
         c.place(x=0, y=0)
-        self.backdrop_item = c.create_image(VOL_COL_W + 1, 0, anchor="nw")
-        c.create_line(VOL_COL_W, 0, VOL_COL_W, HEIGHT, fill=LINE)
+        self.backdrop_item = c.create_image(0, 0, anchor="nw")
 
-        # głośność: szara szyna, wypełnienie w kolorze akcentu, biały suwak i liczba pod spodem
+        # głośność: szara szyna, wypełnienie w kolorze akcentu, biały znacznik i liczba pod spodem
         c.create_rectangle(VOL_X0, VOL_TOP, VOL_X1, VOL_BOTTOM, fill="#5a5a5a", width=0)
         self.vol_fill = c.create_rectangle(VOL_X0, VOL_BOTTOM, VOL_X1, VOL_BOTTOM, fill=OVERLAY_ACCENT, width=0)
         self.vol_thumb = c.create_rectangle(0, 0, 0, 0, fill="#f0f0f0", width=0, state="hidden")
-        self.vol_text = c.create_text((VOL_X0 + VOL_X1) // 2, 103, text="--", fill="white", font=self.small_font)
+        self.vol_text = c.create_text((VOL_X0 + VOL_X1) // 2, VOL_TEXT_Y, text="--", fill="white", font=self.small_font)
 
         self.cover_item = c.create_image(COVER_X, COVER_Y, anchor="nw")
 
