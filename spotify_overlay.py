@@ -814,9 +814,11 @@ def ui(fn):
 
 BG = "#1f1f1f"
 WIDTH, HEIGHT = 400, 120
-COVER_X, COVER_Y, COVER_SIZE = 48, 10, 100
-TEXT_X = COVER_X + COVER_SIZE + 14      # 162
-TEXT_W = WIDTH - TEXT_X - 14            # 224
+# okładka stoi trochę dalej od paska (24 px) niż pasek od krawędzi (20 px) – korekta optyczna: krawędź okna jest
+# niewidoczna, więc przy równych odstępach okładka wyglądała na zbyt bliską
+COVER_X, COVER_Y, COVER_SIZE = 52, 10, 100
+TEXT_X = COVER_X + COVER_SIZE + 14      # 166
+TEXT_W = WIDTH - TEXT_X - 14            # 220
 STATE_Y = 93                            # środek linii z ikoną stanu i czasem
 PROGRESS_Y = COVER_Y + COVER_SIZE - 3   # dół paska postępu równo z dołem okładki
 # pionowy pasek głośności na całą wysokość: od góry okładki, liczba pod spodem kończy się równo z dołem okładki
